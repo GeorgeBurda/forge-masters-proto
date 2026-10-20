@@ -567,7 +567,7 @@ function drawSmiths() {
 // ---------------- reels ----------------
 var reels = [0, 1, 2, 3].map(function (r) { return { band: Lg.windowAt(r, (Math.random() * Lg.STRIPS[r].length) | 0).slice(), k: 0, D: 0, t0: 0, tS: 0, v: 0, spinning: false, landed: true, sq: 0, sqT: -9, final: null, wild: false, flash: 0 }; });
 var shownGrid = reels.map(function (re) { return re.band.slice(0, 3); });
-var landedCb = null;
+var landedCb = null, spinT0 = 0;
 function startReels(o) {
   var base = now + 40;
   for (var r = 0; r < R; r++) {
@@ -583,13 +583,15 @@ function startReels(o) {
   }
   anticip = -1;
 }
-function reelPos(re) { // returns k (top visible band index offset from 1)
+function reelPos(re) { // band offset; time-to-stop based so extended stops (anticipation / Master Strike beat) keep spinning
   if (!re.spinning) return 0;
-  var t = (now - re.t0) / 1000, tt = (re.tS - re.t0) / 1000;
+  var t = (now - re.t0) / 1000;
   if (t <= 0) return re.D;
-  if (t >= tt) return 0;
-  var a = re.acc, d = t < a ? 0.5 * re.v / a * t * t : 0.5 * re.v * a + re.v * (t - a);
-  return Math.max(0, re.D - d);
+  if (now >= re.tS) return 0;
+  var rem = re.v * (re.tS - now) / 1000, a = re.acc;
+  if (rem > re.D) rem = 3 + ((rem - 3) % (re.D - 3));
+  if (t < a) return Math.min(re.D - 0.5 * re.v / a * t * t, rem);
+  return rem;
 }
 function updReels() {
   for (var r = 0; r < R; r++) {
@@ -603,7 +605,7 @@ function updReels() {
   }
 }
 function landReel(r) {
-  var re = reels[r], o = outcome; re.landed = true; re.spinning = false; re.k = 0;
+  var re = reels[r], o = outcome; re.landed = true; re.spinning = false; re.k = 0; FM.landT[r] = Math.round(now - spinT0);
   var big = !!o.ms[r];
   re.sqT = now; re.sqBig = big;
   smithStrike(r, big);
@@ -892,7 +894,7 @@ async function baseSpin() {
   shownBal = bal0 - BET; shownWin = 0;
   updateDebug('decided');
   SFX.whoosh();
-  var landed = new Promise(function (res) { landedCb = res; });
+  var landed = new Promise(function (res) { landedCb = res; }); spinT0 = now; FM.landT = [];
   startReels(o);
   await landed;
   if (o.lineWin > 0) {
@@ -1047,7 +1049,7 @@ setInterval(function () { if (DEBUG && state === 'idle') updateDebug('tick', his
 var FM = window.FM = {
   get state() { return state; }, get outcome() { return outcome; }, get spinNo() { return spinNo; }, get balance() { return balance; },
   get shownWin() { return shownWin; }, get shownBal() { return shownBal; }, get heat() { return heat.slice(); }, get fps() { return fps; },
-  get shownGrid() { return shownGrid.map(function (c) { return c.slice(); }); }, history: history, seed: SEED, bonusShown: null,
+  get shownGrid() { return shownGrid.map(function (c) { return c.slice(); }); }, history: history, seed: SEED, bonusShown: null, landT: [],
   layout: function () { return { K: K, OX: OX, OY: OY, Lh: Lh, reelTop: reelTop, cellH: cellH, colW: colW, x0: x0, gap: gap, smithH: smithH, furnace: furnaceC(), smiths: [0, 1, 2, 3].map(function (i) { var b = smithBase(i), s = C.smith[i]; return { x: b.x, y: b.y - s.h * 0.5 }; }) }; },
   toScreen: function (x, y) { return { x: OX + x * K, y: OY + y * K }; },
   get armed() { return { ms: armedMs.slice(), bonus: armedBonus }; },
