@@ -548,7 +548,7 @@ function drawSmiths() {
   for (var i = 0; i < 4; i++) {
     var b = smithBase(i), p = smithPose(i), s = C.smith[i];
     // armed glow
-    if (armedMs[i]) { var pa = 0.55 + 0.35 * Math.sin(now / 140); ctx.globalCompositeOperation = 'lighter'; ctx.globalAlpha = pa; ctx.drawImage(C.glow.hot, b.x - s.w * 0.85, b.y - s.h * 1.05, s.w * 1.7, s.h * 1.1); ctx.globalCompositeOperation = 'source-over'; ctx.globalAlpha = 1; }
+    if (armedMs[i]) { var pa = 0.75 + 0.25 * Math.sin(now / 140); ctx.globalCompositeOperation = 'lighter'; ctx.globalAlpha = pa; ctx.drawImage(C.glow.gold, b.x - s.w * 0.9, b.y - s.h * 1.12, s.w * 1.8, s.h * 1.25); ctx.drawImage(C.glow.hot, b.x - s.w * 0.6, b.y - s.h * 0.95, s.w * 1.2, s.h * 0.9); ctx.globalCompositeOperation = 'source-over'; ctx.globalAlpha = 1; }
     if (p.rot === 0 && p.sx === 1 && p.sy === 1) blit(s.c, b.x - s.w / 2, b.y + p.dy - s.h);
     else { ctx.save(); ctx.translate(b.x, b.y + p.dy); ctx.rotate(p.rot); ctx.scale(p.sx, p.sy); ctx.drawImage(s.c, -s.w / 2, -s.h, s.w, s.h); ctx.restore(); }
     // hammer smear on strike
@@ -560,7 +560,7 @@ function drawSmiths() {
       ctx.beginPath(); ctx.moveTo(hx, hy); ctx.quadraticCurveTo(hx - 50, (hy + ty) / 2, tx - 10, ty); ctx.stroke();
       ctx.globalCompositeOperation = 'source-over'; ctx.globalAlpha = 1;
     }
-    if (armedMs[i]) txt('MASTER STRIKE', b.x, b.y - s.h - 6 + Math.round(Math.sin(now / 200) * 3), 19, '#ffe08a', '#5a1d00', 'center');
+    if (armedMs[i]) txt('MASTER STRIKE', b.x, b.y - s.h - 8 + Math.round(Math.sin(now / 200) * 3), 23, '#ffe08a', '#5a1d00', 'center');
   }
 }
 
@@ -908,7 +908,7 @@ async function baseSpin() {
 }
 async function bonusFlow(o, balBefore) {
   var B = o.bonus;
-  state = 'bonus'; skip = false; banner = null;
+  state = 'bonus'; skip = false; banner = null; FM.bstep = -1;
   // anvils celebrate
   for (var a = 0; a < o.anvils.length; a++) { var c = o.anvils[a], r = (c / 3) | 0; reels[r].sqT = now; smithCheer(r, a * 80); sparks(colX(r) + colW / 2, reelTop + (c % 3) * cellH + cellH / 2, 16, 0.8); }
   SFX.anvil();
@@ -926,7 +926,7 @@ async function bonusFlow(o, balBefore) {
   }
   await wait(400);
   for (var s = 0; s < B.steps.length; s++) {
-    var st = B.steps[s];
+    var st = B.steps[s]; FM.bstep = s;
     bon.spinning = true; SFX.whoosh();
     await wait(620);
     bon.spinning = false;
@@ -969,14 +969,14 @@ async function bonusFlow(o, balBefore) {
   // jackpot + count-up
   var nf = B.nForged;
   if (nf > 0) {
-    if (!skip) { bannerShow(B.jpName + ' JACKPOT', fmt(B.jackpot * BET), 2000, '#ffd84a'); SFX.fanfare(true); for (r = 0; r < R; r++) smithCheer(r, r * 80); star(Lw / 2, reelTop + cellH * 1.5, 50); }
+    if (!skip) { bannerShow(B.jpName + ' JACKPOT', fmt(B.jackpot * BET), 2000, '#ffd84a', null, reelTop - capH - 130); SFX.fanfare(true); for (r = 0; r < R; r++) smithCheer(r, r * 80); star(Lw / 2, reelTop + cellH * 1.5, 50); }
     await wait(2100);
   }
   await countUp(o.lineWin, o.lineWin + B.win, balBefore);
   // end screen: shows until tap (or 6 s)
   skip = false; state = 'bonusEnd';
   shownWin = o.total; shownBal = balBefore + B.win;
-  bannerShow('FORGE WIN', fmt(B.win) + (nf ? '' : ''), 0, '#ffe066');
+  bannerShow('FORGE WIN', fmt(B.win), 0, '#ffe066', null, reelTop - capH - 130);
   if (nf) banner.text = B.jpName + ' + FORGE WIN';
   for (r = 0; r < R; r++) smithCheer(r, r * 90);
   SFX.fanfare(false);
