@@ -1,1 +1,1013 @@
-<!doctype html><meta charset=utf-8><title>Forge Masters</title><body style="background:#111;color:#eee">Forge Masters prototype — building…</body>
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no,viewport-fit=cover">
+<link rel="icon" href="data:,">
+<meta name="theme-color" content="#120c0a">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<title>Forge Masters</title>
+<style>
+@font-face{font-family:'Lilita';src:url(assets/lilita.ttf) format('truetype');font-display:block}
+html,body{margin:0;height:100%;background:#0d0907;overflow:hidden;touch-action:none;-webkit-user-select:none;user-select:none;-webkit-tap-highlight-color:transparent}
+canvas{position:fixed;left:0;top:0;width:100vw;height:100vh;display:block}
+#dbg{position:fixed;right:4px;top:calc(4.6vh + 4px);max-width:62vw;font:9px/1.2 ui-monospace,Menlo,Consolas,monospace;color:#cfe;background:rgba(0,0,0,.6);padding:4px 6px;border-radius:4px;white-space:pre;pointer-events:none;z-index:5;display:none}
+#load{position:fixed;inset:0;display:flex;align-items:center;justify-content:center;color:#f7b65a;font:20px sans-serif}
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<div id="dbg"></div>
+<div id="load">Heating the forge…</div>
+<script>
+// Forge Masters — game logic & math (shared by the game and the Monte Carlo sim)
+(function (G) {
+'use strict';
+var BET = 10;
+// symbol ids
+var S = { HORSESHOE: 0, HAMMER: 1, TONGS: 2, HELMET: 3, SHIELD: 4, AXE: 5, SWORD: 6, MEDAL: 7, WILD: 8, ANVIL: 9 };
+var NAMES = ['horseshoe', 'hammer', 'tongs', 'helmet', 'shield', 'axe', 'sword', 'medal', 'wild', 'anvil'];
+var NPAY = 8, REELS = 4, ROWS = 3;
+// pays in coins per way (bet 10), index = kind length (3,4)
+var PAY = [
+  /*horseshoe*/[0, 0, 0, 1, 4],
+  /*hammer   */[0, 0, 0, 1, 4],
+  /*tongs    */[0, 0, 0, 2, 5],
+  /*helmet   */[0, 0, 0, 2, 6],
+  /*shield   */[0, 0, 0, 3, 9],
+  /*axe      */[0, 0, 0, 4, 11],
+  /*sword    */[0, 0, 0, 5, 15],
+  /*medal    */[0, 0, 0, 10, 28]
+];
+// symbol counts per reel strip: [horseshoe,hammer,tongs,helmet,shield,axe,sword,medal,wild,anvil]
+var STRIP_COUNTS = [
+  [12, 12, 12, 11, 9, 8, 6, 5, 0, 3],
+  [12, 12, 11, 10, 9, 8, 6, 5, 2, 3],
+  [12, 12, 11, 10, 9, 8, 6, 5, 2, 3],
+  [12, 12, 11, 10, 9, 8, 6, 5, 2, 3]
+];
+// Master Strike: chance per spin, and distribution of number of struck reels
+var MS_P = 1 / 13.5;
+var MS_K = [[1, 0.86], [2, 0.12], [3, 0.018], [4, 0.002]];
+// Bonus (Forge, hold & spin)
+var B_RESPINS = 3;
+var B_PINGOT = 0.111;    // per empty cell per respin
+var B_PHAMMER = 0.02;   // per empty cell per respin (Master Hammer, also an ingot)
+var B_DECAY = 0.85;     // landing chance shrinks as the grid fills: p *= 1 - B_DECAY*filled/12
+var B_VALS = [1, 2, 3, 4, 5, 8, 10, 20, 50];          // x bet
+var B_VW = [300, 230, 150, 110, 90, 50, 40, 22, 8];
+var JACKPOTS = [0, 20, 50, 200, 1000];                 // by forged reels, x bet
+var JP_NAMES = ['', 'MINI', 'MINOR', 'MAJOR', 'GRAND'];
+
+// ---------- RNG (sfc32 seeded via splitmix32) ----------
+function makeRng(seed) {
+  var s = seed >>> 0;
+  function sm() { s = (s + 0x9E3779B9) >>> 0; var z = s; z = Math.imul(z ^ (z >>> 16), 0x85ebca6b); z = Math.imul(z ^ (z >>> 13), 0xc2b2ae35); return (z ^ (z >>> 16)) >>> 0; }
+  var a = sm(), b = sm(), c = sm(), d = sm();
+  function r() {
+    var t = (a + b | 0) + d | 0; d = d + 1 | 0; a = b ^ b >>> 9; b = c + (c << 3) | 0; c = (c << 21 | c >>> 11); c = c + t | 0;
+    return (t >>> 0) / 4294967296;
+  }
+  for (var i = 0; i < 12; i++) r();
+  return r;
+}
+
+// ---------- strips (deterministic build) ----------
+function buildStrips() {
+  var rng = makeRng(20261020), strips = [];
+  for (var r = 0; r < REELS; r++) {
+    var cnt = STRIP_COUNTS[r], pool = [];
+    for (var s = 0; s < 9; s++) for (var k = 0; k < cnt[s]; k++) pool.push(s);
+    var best = null;
+    for (var attempt = 0; attempt < 400; attempt++) {
+      for (var i = pool.length - 1; i > 0; i--) { var j = (rng() * (i + 1)) | 0, t = pool[i]; pool[i] = pool[j]; pool[j] = t; }
+      // insert anvils evenly spaced
+      var L = pool.length + cnt[9], st = [], na = cnt[9], ai = 0, pi = 0, off = (rng() * (L / na)) | 0;
+      var apos = {}; for (var a = 0; a < na; a++) apos[(off + Math.round(a * L / na)) % L] = 1;
+      for (var p = 0; p < L; p++) st.push(apos[p] ? S.ANVIL : pool[pi++]);
+      // constraints: no wild within 2 of another wild (cyclic), no 3 identical in a row
+      var ok = true;
+      for (p = 0; p < L && ok; p++) {
+        var x = st[p], y = st[(p + 1) % L], z = st[(p + 2) % L];
+        if (x === S.WILD && (y === S.WILD || z === S.WILD)) ok = false;
+        if (x === y && y === z) ok = false;
+      }
+      if (ok) { best = st; break; }
+    }
+    strips.push(best || st);
+  }
+  return strips;
+}
+var STRIPS = buildStrips();
+
+function pick(rng, w) { var t = 0, i; for (i = 0; i < w.length; i++) t += w[i]; var x = rng() * t; for (i = 0; i < w.length; i++) { x -= w[i]; if (x < 0) return i; } return w.length - 1; }
+var VW_TOT = B_VW.reduce(function (a, b) { return a + b; }, 0);
+function ingotVal(rng) { var x = rng() * VW_TOT; for (var i = 0; i < B_VW.length; i++) { x -= B_VW[i]; if (x < 0) return B_VALS[i]; } return B_VALS[0]; }
+
+function windowAt(r, stop) { var st = STRIPS[r], L = st.length; return [st[stop % L], st[(stop + 1) % L], st[(stop + 2) % L]]; }
+function hasAnvil(col) { return col[0] === S.ANVIL || col[1] === S.ANVIL || col[2] === S.ANVIL; }
+
+// ---------- ways evaluation ----------
+function evalWays(grid) {
+  var wins = [], total = 0;
+  for (var s = 0; s < NPAY; s++) {
+    var ways = 1, len = 0;
+    for (var r = 0; r < REELS; r++) {
+      var col = grid[r], c = 0;
+      for (var y = 0; y < ROWS; y++) if (col[y] === s || col[y] === S.WILD) c++;
+      if (!c) break;
+      ways *= c; len++;
+    }
+    if (len >= 3) {
+      var w = PAY[s][len] * ways;
+      if (w > 0) { wins.push({ sym: s, len: len, ways: ways, win: w }); total += w; }
+    }
+  }
+  return { wins: wins, total: total };
+}
+
+// ---------- bonus ----------
+// cells indexed r*3+y. vals[i] = 0 empty, else x bet value.
+function playBonus(rng, startCells, cheat) {
+  var vals = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], i, r, y;
+  var init = [];
+  for (i = 0; i < startCells.length; i++) { var v = ingotVal(rng); vals[startCells[i]] = v; init.push({ c: startCells[i], v: v }); }
+  var forged = [0, 0, 0, 0], steps = [], respins = B_RESPINS, filled = startCells.length, nsteps = 0;
+  function checkForge(out) {
+    for (var rr = 0; rr < REELS; rr++) if (!forged[rr] && vals[rr * 3] && vals[rr * 3 + 1] && vals[rr * 3 + 2]) { forged[rr] = 1; out.push(rr); }
+  }
+  var f0 = []; checkForge(f0);
+  while (respins > 0 && filled < 12) {
+    var step = { lands: [], hammers: [], forged: [], respinsBefore: respins };
+    var any = false, fk = 1 - B_DECAY * filled / 12, pI = B_PINGOT * fk, pH = B_PHAMMER * fk;
+    for (r = 0; r < REELS; r++) {
+      var reelHam = [];
+      for (y = 0; y < ROWS; y++) {
+        i = r * 3 + y;
+        if (vals[i]) continue;
+        var x = rng();
+        if (x < pI) { var v1 = ingotVal(rng); vals[i] = v1; step.lands.push({ c: i, v: v1, h: 0 }); filled++; any = true; }
+        else if (x < pI + pH) { var v2 = ingotVal(rng); vals[i] = v2; step.lands.push({ c: i, v: v2, h: 1 }); reelHam.push(i); filled++; any = true; }
+      }
+      for (var h = 0; h < reelHam.length; h++) {
+        var before = [vals[r * 3], vals[r * 3 + 1], vals[r * 3 + 2]];
+        for (y = 0; y < ROWS; y++) vals[r * 3 + y] *= 2;
+        step.hammers.push({ r: r, c: reelHam[h], before: before, after: [vals[r * 3], vals[r * 3 + 1], vals[r * 3 + 2]] });
+      }
+    }
+    checkForge(step.forged);
+    respins = any ? B_RESPINS : respins - 1;
+    step.respinsAfter = respins;
+    steps.push(step);
+    if (++nsteps > 200) break;
+  }
+  var nf = forged[0] + forged[1] + forged[2] + forged[3], sum = 0;
+  for (i = 0; i < 12; i++) sum += vals[i];
+  var jp = JACKPOTS[nf];
+  return { init: init, initForged: f0, steps: steps, vals: vals, forged: forged, nForged: nf, ingotSum: sum, jackpot: jp, jpName: JP_NAMES[nf],
+    win: (sum + jp) * BET, filled: filled };
+}
+
+// ---------- spin ----------
+// cheat: { ms: [bool x4] , bonus: bool }
+function spin(rng, cheat) {
+  var stops = [], cols = [], r, y;
+  var forceBonus = cheat && cheat.bonus, forceMs = cheat && cheat.ms;
+  var bonusReels = null;
+  if (forceBonus) {
+    // 3 random reels (excluding cheat-MS reels where possible) show an anvil
+    var cand = [0, 1, 2, 3].filter(function (q) { return !(forceMs && forceMs[q]); });
+    if (cand.length < 3) cand = [0, 1, 2, 3];
+    for (var i = cand.length - 1; i > 0; i--) { var j = (rng() * (i + 1)) | 0, t = cand[i]; cand[i] = cand[j]; cand[j] = t; }
+    bonusReels = cand.slice(0, 3);
+  }
+  for (r = 0; r < REELS; r++) {
+    var L = STRIPS[r].length, s;
+    if (bonusReels) {
+      var want = bonusReels.indexOf(r) >= 0, guard = 0;
+      do { s = (rng() * L) | 0; } while (hasAnvil(windowAt(r, s)) !== want && ++guard < 1000);
+    } else if (forceMs && forceMs[r]) {
+      var g2 = 0; do { s = (rng() * L) | 0; } while (hasAnvil(windowAt(r, s)) && ++g2 < 1000);
+    } else s = (rng() * L) | 0;
+    stops.push(s); cols.push(windowAt(r, s));
+  }
+  // Master Strike decided at spin start (natural), plus cheat-forced reels
+  var ms = [0, 0, 0, 0], msNatural = rng() < MS_P;
+  if (msNatural) {
+    var kk = MS_K[pick(rng, MS_K.map(function (e) { return e[1]; }))][0];
+    var cands = [];
+    for (r = 0; r < REELS; r++) if (!hasAnvil(cols[r])) cands.push(r);
+    for (var a = cands.length - 1; a > 0; a--) { var b = (rng() * (a + 1)) | 0, tt = cands[a]; cands[a] = cands[b]; cands[b] = tt; }
+    for (a = 0; a < Math.min(kk, cands.length); a++) ms[cands[a]] = 1;
+  }
+  if (forceMs) for (r = 0; r < REELS; r++) if (forceMs[r]) ms[r] = 1;
+  var grid = [];
+  for (r = 0; r < REELS; r++) grid.push(ms[r] ? [S.WILD, S.WILD, S.WILD] : cols[r].slice());
+  var ev = evalWays(grid);
+  var anvils = [];
+  for (r = 0; r < REELS; r++) for (y = 0; y < ROWS; y++) if (grid[r][y] === S.ANVIL) anvils.push(r * 3 + y);
+  var bonus = null;
+  if (anvils.length >= 3) bonus = playBonus(rng, anvils);
+  return { stops: stops, pre: cols, grid: grid, ms: ms, msCount: ms[0] + ms[1] + ms[2] + ms[3], wins: ev.wins, lineWin: ev.total,
+    anvils: anvils, bonus: bonus, total: ev.total + (bonus ? bonus.win : 0), cheat: !!(forceBonus || (forceMs && forceMs.some(Boolean))) };
+}
+
+var API = { BET: BET, S: S, NAMES: NAMES, PAY: PAY, STRIPS: STRIPS, STRIP_COUNTS: STRIP_COUNTS, REELS: REELS, ROWS: ROWS,
+  MS_P: MS_P, MS_K: MS_K, JACKPOTS: JACKPOTS, JP_NAMES: JP_NAMES, B_RESPINS: B_RESPINS,
+  makeRng: makeRng, spin: spin, evalWays: evalWays, playBonus: playBonus, windowAt: windowAt,
+  _set: function (o) { if (o.MS_P != null) MS_P = o.MS_P; if (o.B_PINGOT != null) B_PINGOT = o.B_PINGOT; if (o.B_PHAMMER != null) B_PHAMMER = o.B_PHAMMER; if (o.B_DECAY != null) B_DECAY = o.B_DECAY; if (o.STRIP_COUNTS) { STRIP_COUNTS = o.STRIP_COUNTS; STRIPS = buildStrips(); API.STRIPS = STRIPS; } if (o.PAY) { PAY = o.PAY; API.PAY = PAY; } } };
+if (typeof module !== 'undefined' && module.exports) module.exports = API; else G.FML = API;
+})(this);
+
+// Synthesized WebAudio SFX (no files)
+var SFX = (function () {
+  var Q = new URLSearchParams(location.search), muted = Q.get('mute') === '1';
+  var ac = null, master = null, noiseBuf = null;
+  function init() {
+    if (muted || ac) return;
+    try { ac = new (window.AudioContext || window.webkitAudioContext)(); } catch (e) { muted = true; return; }
+    master = ac.createGain(); master.gain.value = 0.55;
+    var comp = ac.createDynamicsCompressor(); master.connect(comp); comp.connect(ac.destination);
+    noiseBuf = ac.createBuffer(1, ac.sampleRate, ac.sampleRate);
+    var d = noiseBuf.getChannelData(0); for (var i = 0; i < d.length; i++) d[i] = Math.random() * 2 - 1;
+  }
+  function unlock() { init(); if (ac && ac.state === 'suspended') ac.resume(); }
+  function ok() { return ac && !muted && ac.state === 'running'; }
+  function env(g, t, a, peak, dec) { g.gain.setValueAtTime(0.0001, t); g.gain.exponentialRampToValueAtTime(peak, t + a); g.gain.exponentialRampToValueAtTime(0.0001, t + a + dec); }
+  function tone(type, f, t, a, peak, dec, f2) {
+    var o = ac.createOscillator(), g = ac.createGain(); o.type = type; o.frequency.setValueAtTime(f, t);
+    if (f2) o.frequency.exponentialRampToValueAtTime(f2, t + a + dec);
+    env(g, t, a, peak, dec); o.connect(g); g.connect(master); o.start(t); o.stop(t + a + dec + 0.05);
+  }
+  function noise(t, dur, peak, type, freq, q, f2) {
+    var s = ac.createBufferSource(); s.buffer = noiseBuf; s.loop = true;
+    var fl = ac.createBiquadFilter(); fl.type = type || 'bandpass'; fl.frequency.setValueAtTime(freq || 1000, t); if (f2) fl.frequency.exponentialRampToValueAtTime(f2, t + dur); fl.Q.value = q || 1;
+    var g = ac.createGain(); env(g, t, 0.005, peak, dur);
+    s.connect(fl); fl.connect(g); g.connect(master); s.start(t, Math.random()); s.stop(t + dur + 0.05);
+  }
+  var API = {
+    unlock: unlock,
+    get muted() { return muted; },
+    clink: function (power, pitch) { // hammer on metal
+      if (!ok()) return; var t = ac.currentTime, p = power || 1, k = pitch || 1;
+      [1, 2.76, 5.4, 8.93].forEach(function (m, i) { tone('sine', 820 * k * m, t, 0.002, 0.18 * p / (i + 1), 0.25 + 0.5 / (i + 1)); });
+      noise(t, 0.04, 0.3 * p, 'highpass', 3000, 0.7);
+    },
+    thud: function (power) {
+      if (!ok()) return; var t = ac.currentTime, p = power || 1;
+      tone('sine', 140, t, 0.004, 0.5 * p, 0.22 * p + 0.08, 45);
+      noise(t, 0.12 * p, 0.35 * p, 'lowpass', 600, 0.8, 120);
+    },
+    sizzle: function (amt) {
+      if (!ok()) return; var t = ac.currentTime; noise(t, 0.9 + amt * 0.6, 0.06 + 0.1 * amt, 'highpass', 5000, 0.5, 2500);
+    },
+    whoosh: function () { if (!ok()) return; var t = ac.currentTime; noise(t, 0.25, 0.08, 'bandpass', 500, 0.8, 1800); },
+    tick: function (i) { if (!ok()) return; var t = ac.currentTime; tone('triangle', 1200 + (i % 8) * 60, t, 0.002, 0.05, 0.05); },
+    coin: function (k) { if (!ok()) return; var t = ac.currentTime; tone('square', 990 * (k || 1), t, 0.003, 0.06, 0.08); tone('square', 1320 * (k || 1), t + 0.07, 0.003, 0.06, 0.14); },
+    anvil: function () { if (!ok()) return; var t = ac.currentTime; [1, 2.4, 3.9].forEach(function (m, i) { tone('sine', 520 * m, t, 0.002, 0.22 / (i + 1), 0.9); }); tone('sine', 110, t, 0.004, 0.4, 0.3, 50); },
+    rumble: function (dur) { if (!ok()) return; var t = ac.currentTime; noise(t, dur, 0.18, 'lowpass', 180, 1, 400); tone('sawtooth', 55, t, 0.3, 0.05, dur, 110); },
+    fanfare: function (big) {
+      if (!ok()) return; var t = ac.currentTime, n = big ? [523, 659, 784, 1047, 784, 1047, 1319] : [523, 659, 784, 1047];
+      n.forEach(function (f, i) { tone('square', f, t + i * 0.11, 0.01, 0.07, i === n.length - 1 ? 0.6 : 0.12); tone('triangle', f / 2, t + i * 0.11, 0.01, 0.08, 0.2); });
+    },
+    strikeBig: function () {
+      if (!ok()) return; var t = ac.currentTime; API.clink(1.6, 0.8); API.thud(1.6);
+      noise(t + 0.02, 0.6, 0.25, 'bandpass', 900, 0.6, 200); tone('sawtooth', 220, t, 0.005, 0.12, 0.5, 60);
+    },
+    forge: function () { if (!ok()) return; API.clink(1.3, 1.2); var t = ac.currentTime; [784, 988, 1175, 1568].forEach(function (f, i) { tone('triangle', f, t + 0.08 + i * 0.07, 0.005, 0.09, 0.35); }); }
+  };
+  return API;
+})();
+
+// Forge Masters — renderer, flows, cheats, test hooks
+(function () {
+'use strict';
+var Lg = window.FML, S = Lg.S, BET = Lg.BET, R = 4, ROWS = 3;
+var Q = new URLSearchParams(location.search);
+var SEED = Q.has('seed') ? (parseInt(Q.get('seed'), 10) >>> 0) : ((Date.now() ^ Math.floor(Math.random() * 4294967295)) >>> 0);
+var DEBUG = Q.get('debug') === '1';
+var rng = Lg.makeRng(SEED);
+var FONT = "'Lilita', 'Arial Rounded MT Bold', 'Trebuchet MS', system-ui, sans-serif";
+var SYMN = ['horseshoe', 'hammer', 'tongs', 'helmet', 'shield', 'axe', 'sword', 'medal', 'wild', 'anvil', 'ingot', 'mhammer'];
+var SYM_INGOT = 10, SYM_MH = 11;
+var cv = document.getElementById('c'), ctx = cv.getContext('2d', { alpha: false });
+var dbgEl = document.getElementById('dbg');
+var IMG = {};
+var now = performance.now();
+
+// ---------------- state ----------------
+var balance = 10000, shownBal = balance, shownWin = 0;
+var state = 'load'; // load | idle | spin | present | bonus | bonusEnd
+var outcome = null, spinNo = 0, skip = false;
+var armedMs = [0, 0, 0, 0], armedBonus = 0;
+var heat = [0, 0, 0, 0], lastActive = 0, coolingPuffT = [0, 0, 0, 0];
+var bonusHeat = 0, bonusHeatTarget = 0;
+var shake = 0, flashA = 0;
+var winFx = null; // {cells:Set, wins, t0}
+var banner = null; // {text, sub, t0, dur, color}
+var bon = null; // bonus display state
+var history = []; // test log of shown vs outcome
+var labelText = '', labelT = 0;
+var anticip = -1;
+
+// ---------------- layout ----------------
+var Lw = 720, Lh = 1280, K = 1, OX = 0, OY = 0, DPR = 1, VW = 0, VH = 0;
+var colW = 160, gap = 12, x0 = 22, cellH = 170, reelTop = 640, capH = 46, smithH = 290, sb = 1, bgX = 0;
+function colX(r) { return x0 + r * (colW + gap); }
+function layout() {
+  VW = window.innerWidth; VH = window.innerHeight;
+  DPR = Math.min(window.devicePixelRatio || 1, 2);
+  Lh = Math.max(1280, Math.min(1560, Math.round(Lw * VH / VW)));
+  K = Math.min(VW / Lw, VH / Lh);
+  OX = (VW - Lw * K) / 2; OY = (VH - Lh * K) / 2;
+  cv.width = Math.round(VW * DPR); cv.height = Math.round(VH * DPR);
+  sb = Lh / 1280; bgX = (Lw - Lw * sb) / 2;
+  cellH = 168;
+  var reelH = cellH * 3;
+  var bottomMargin = Math.round(0.085 * Lh + 34);
+  reelTop = Lh - reelH - bottomMargin;
+  smithH = Math.min(345, reelTop - capH - 150);
+  buildCaches();
+}
+
+// ---------------- caches ----------------
+var C = {};
+function mk(w, h) { var c = document.createElement('canvas'); c.width = Math.max(1, Math.ceil(w)); c.height = Math.max(1, Math.ceil(h)); return c; }
+var PX = function (v) { return v * K * DPR; };
+function buildCaches() {
+  // symbols
+  var ss = Math.min(colW, cellH) * 0.86; C.symSize = ss;
+  C.sym = []; C.symBlur = [];
+  for (var i = 0; i < SYMN.length; i++) {
+    var im = IMG['sym_' + SYMN[i]], c = mk(PX(ss), PX(ss)), g = c.getContext('2d');
+    g.imageSmoothingQuality = 'high'; g.drawImage(im, 0, 0, c.width, c.height); C.sym.push(c);
+    var b = mk(PX(ss), PX(ss * 1.5)), gb = b.getContext('2d'), n = 10;
+    for (var j = 0; j < n; j++) { gb.globalAlpha = 0.19; gb.drawImage(c, 0, (j / (n - 1)) * (b.height - c.height)); }
+    C.symBlur.push(b);
+  }
+  // smiths
+  C.smith = [];
+  for (i = 0; i < 4; i++) {
+    var sm = IMG['smith_' + i], sh = smithH, sw = sh * sm.width / sm.height;
+    var c2 = mk(PX(sw), PX(sh)); var g2 = c2.getContext('2d'); g2.imageSmoothingQuality = 'high'; g2.drawImage(sm, 0, 0, c2.width, c2.height);
+    var mw = 48, mh = Math.round(48 * sm.height / sm.width), mc = mk(mw, mh), mg = mc.getContext('2d'); mg.drawImage(sm, 0, 0, mw, mh);
+    var md = mg.getImageData(0, 0, mw, mh).data, mask = new Uint8Array(mw * mh); for (var q = 0; q < mw * mh; q++) mask[q] = md[q * 4 + 3] > 60 ? 1 : 0;
+    C.smith.push({ c: c2, w: sw, h: sh, mask: mask, mw: mw, mh: mh });
+  }
+  // glow sprites
+  C.glow = {};
+  [['white', '255,255,255'], ['hot', '255,150,40'], ['gold', '255,215,90'], ['red', '255,70,30']].forEach(function (e) {
+    var c3 = mk(128, 128), g3 = c3.getContext('2d'), gr = g3.createRadialGradient(64, 64, 0, 64, 64, 64);
+    gr.addColorStop(0, 'rgba(' + e[1] + ',1)'); gr.addColorStop(0.35, 'rgba(' + e[1] + ',0.45)'); gr.addColorStop(1, 'rgba(' + e[1] + ',0)');
+    g3.fillStyle = gr; g3.fillRect(0, 0, 128, 128); C.glow[e[0]] = c3;
+  });
+  var st = mk(64, 64), gs = st.getContext('2d'), gg = gs.createRadialGradient(32, 32, 0, 32, 32, 32);
+  gg.addColorStop(0, 'rgba(235,235,240,0.8)'); gg.addColorStop(0.6, 'rgba(220,220,230,0.3)'); gg.addColorStop(1, 'rgba(220,220,230,0)');
+  gs.fillStyle = gg; gs.fillRect(0, 0, 64, 64); C.steam = st;
+  // forged sword (vertical) cache
+  var swL = cellH * 3 * 1.02, sws = swL / Math.SQRT2, csw = mk(PX(colW), PX(cellH * 3)), gw = csw.getContext('2d');
+  gw.translate(csw.width / 2, csw.height / 2); gw.rotate(-Math.PI / 4); var ssz = PX(sws * 1.12);
+  gw.drawImage(IMG.sym_sword, -ssz / 2, -ssz / 2, ssz, ssz); C.sword = csw;
+  C.labels = {};
+  buildStatic();
+  C.top = null; C.topKey = '';
+}
+function buildStatic() {
+  var c = mk(cv.width, cv.height), g = c.getContext('2d');
+  g.fillStyle = '#0d0907'; g.fillRect(0, 0, c.width, c.height);
+  if (OX > 1 || OY > 1) { // desktop backdrop
+    var s = Math.max(VW / 720, VH / 1280) * DPR, w = 720 * s, h = 1280 * s;
+    try { g.filter = 'blur(' + Math.round(10 * DPR) + 'px) brightness(0.45)'; } catch (e) {}
+    g.drawImage(IMG.bg, (c.width - w) / 2, (c.height - h) / 2, w, h); g.filter = 'none';
+    g.fillStyle = 'rgba(0,0,0,0.35)'; g.fillRect(0, 0, c.width, c.height);
+  }
+  g.setTransform(K * DPR, 0, 0, K * DPR, OX * DPR, OY * DPR);
+  g.save(); g.beginPath(); g.rect(0, 0, Lw, Lh); g.clip();
+  g.drawImage(IMG.bg, bgX, 0, Lw * sb, 1280 * sb);
+  // floor darkening under reels
+  var gr = g.createLinearGradient(0, reelTop - 140, 0, Lh); gr.addColorStop(0, 'rgba(0,0,0,0)'); gr.addColorStop(1, 'rgba(0,0,0,0.55)');
+  g.fillStyle = gr; g.fillRect(0, reelTop - 140, Lw, Lh);
+  g.restore();
+  // reel bodies
+  for (var r = 0; r < R; r++) {
+    var x = colX(r), y = reelTop, w2 = colW, h2 = cellH * 3;
+    g.fillStyle = 'rgba(0,0,0,0.5)'; rr(g, x - 6, y - capH - 4, w2 + 12, h2 + capH + 18, 22); g.fill();
+    g.fillStyle = '#3b3633'; rr(g, x - 7, y - capH - 8, w2 + 14, h2 + capH + 16, 22); g.fill();
+    var gm = g.createLinearGradient(x, 0, x + w2, 0); gm.addColorStop(0, '#5d5753'); gm.addColorStop(0.5, '#7a736d'); gm.addColorStop(1, '#4e4844');
+    g.fillStyle = gm; rr(g, x - 4, y - capH - 5, w2 + 8, h2 + capH + 10, 19); g.fill();
+    g.fillStyle = '#1c1715'; rr(g, x + 3, y + 2, w2 - 6, h2 - 4, 13); g.fill();
+    g.fillStyle = '#141010'; rr(g, x + 22, y - capH + 6, w2 - 44, capH - 12, 10); g.fill();
+    // rivets
+    g.fillStyle = '#9b938c'; [[x + 8, y - capH + 6], [x + w2 - 8, y - capH + 6], [x + 8, y + h2 - 2], [x + w2 - 8, y + h2 - 2]].forEach(function (p) { g.beginPath(); g.arc(p[0], p[1], 3.2, 0, 7); g.fill(); });
+  }
+  C.static = c;
+}
+function rr(g, x, y, w, h, r) { g.beginPath(); g.moveTo(x + r, y); g.arcTo(x + w, y, x + w, y + h, r); g.arcTo(x + w, y + h, x, y + h, r); g.arcTo(x, y + h, x, y, r); g.arcTo(x, y, x + w, y, r); g.closePath(); }
+
+// ---------------- heat ----------------
+var HS = [[0, [92, 90, 90]], [0.3, [185, 42, 18]], [0.6, [255, 112, 18]], [0.85, [255, 196, 70]], [1, [255, 246, 222]]];
+function heatRGB(h) {
+  h = Math.max(0, Math.min(1, h));
+  for (var i = 1; i < HS.length; i++) if (h <= HS[i][0]) {
+    var a = HS[i - 1], b = HS[i], t = (h - a[0]) / (b[0] - a[0]);
+    return [a[1][0] + (b[1][0] - a[1][0]) * t | 0, a[1][1] + (b[1][1] - a[1][1]) * t | 0, a[1][2] + (b[1][2] - a[1][2]) * t | 0];
+  }
+  return HS[HS.length - 1][1];
+}
+function vheat(r) { return Math.max(heat[r], bonusHeat); }
+function avgHeat() { return (vheat(0) + vheat(1) + vheat(2) + vheat(3)) / 4; }
+
+// ---------------- particles ----------------
+var P = [];
+function emit(o) { if (P.length > 420) return; P.push(o); }
+function sparks(x, y, n, power, spread) {
+  if (skip) n = Math.min(n, 6);
+  for (var i = 0; i < n; i++) {
+    var a = -Math.PI / 2 + (Math.random() - 0.5) * (spread || 2.6), v = (180 + Math.random() * 520) * (power || 1);
+    emit({ t: 'spark', x: x + (Math.random() - 0.5) * 30, y: y, vx: Math.cos(a) * v, vy: Math.sin(a) * v, life: 0, max: 0.35 + Math.random() * 0.45, s: 2 + Math.random() * 2.5 });
+  }
+}
+function steam(x, y, n) { for (var i = 0; i < n; i++) emit({ t: 'steam', x: x + (Math.random() - 0.5) * 90, y: y, vx: (Math.random() - 0.5) * 30, vy: -40 - Math.random() * 60, life: 0, max: 1.1 + Math.random() * 0.8, s: 30 + Math.random() * 30 }); }
+function ember(x, y) { emit({ t: 'ember', x: x, y: y, vx: (Math.random() - 0.5) * 30, vy: -30 - Math.random() * 70, life: 0, max: 1 + Math.random() * 1.2, s: 1.5 + Math.random() * 2 }); }
+function star(x, y, n) { for (var i = 0; i < n; i++) { var a = Math.random() * 6.283, v = 60 + Math.random() * 240; emit({ t: 'star', x: x, y: y, vx: Math.cos(a) * v, vy: Math.sin(a) * v - 80, life: 0, max: 0.7 + Math.random() * 0.6, s: 3 + Math.random() * 4 }); } }
+function updParticles(dt) {
+  for (var i = P.length - 1; i >= 0; i--) {
+    var p = P[i]; p.life += dt;
+    if (p.life >= p.max) { P[i] = P[P.length - 1]; P.pop(); continue; }
+    if (p.t === 'spark') { p.vy += 1300 * dt; p.vx *= 0.985; }
+    else if (p.t === 'star') { p.vy += 300 * dt; p.vx *= 0.97; }
+    else if (p.t === 'steam') { p.vx *= 0.98; p.s += 40 * dt; }
+    p.x += p.vx * dt; p.y += p.vy * dt;
+  }
+}
+function drawParticles() {
+  ctx.globalCompositeOperation = 'lighter';
+  ctx.lineCap = 'round';
+  for (var i = 0; i < P.length; i++) {
+    var p = P[i], u = p.life / p.max;
+    if (p.t === 'spark') {
+      ctx.strokeStyle = u < 0.3 ? '#fff6c8' : u < 0.6 ? '#ffc040' : '#ff6a1a';
+      ctx.globalAlpha = 1 - u; ctx.lineWidth = p.s;
+      ctx.beginPath(); ctx.moveTo(p.x, p.y); ctx.lineTo(p.x - p.vx * 0.022, p.y - p.vy * 0.022); ctx.stroke();
+    } else if (p.t === 'ember') {
+      ctx.globalAlpha = (1 - u) * 0.9; ctx.fillStyle = '#ff9a30'; ctx.fillRect(p.x, p.y, p.s, p.s);
+    } else if (p.t === 'star') {
+      ctx.globalAlpha = 1 - u; var s = p.s * (1.4 - u); ctx.drawImage(C.glow.gold, p.x - s * 3, p.y - s * 3, s * 6, s * 6);
+    }
+  }
+  ctx.globalCompositeOperation = 'source-over';
+  for (i = 0; i < P.length; i++) {
+    p = P[i]; if (p.t !== 'steam') continue; u = p.life / p.max;
+    ctx.globalAlpha = 0.55 * (1 - u) * Math.min(1, u * 5); ctx.drawImage(C.steam, p.x - p.s, p.y - p.s, p.s * 2, p.s * 2);
+  }
+  ctx.globalAlpha = 1;
+}
+
+// ---------------- smiths ----------------
+var smiths = [0, 1, 2, 3].map(function (i) { return { mode: 'idle', t0: 0, dur: 0, big: false, phase: Math.random() * 6, cheerT: -9, hitT: -9 }; });
+var HAMMER_AT = [[0.28, 0.1], [0.3, 0.1], [0.32, 0.1], [0.35, 0.09]];
+function smithBase(i) { var s = C.smith[i]; return { x: colX(i) + colW / 2, y: reelTop - capH + 26, w: s.w, h: s.h }; }
+function smithWindup(i, dur, big) { var s = smiths[i]; s.mode = 'windup'; s.t0 = now; s.dur = dur; s.big = !!big; }
+function smithStrike(i, big) { var s = smiths[i]; s.mode = 'strike'; s.t0 = now; s.big = !!big; s.hitT = now; }
+function smithCheer(i, delay) { smiths[i].cheerT = now + (delay || 0); }
+function smithPose(i) {
+  var s = smiths[i], h = vheat(i), t = now / 1000, sx = 1, sy = 1, rot = 0, dy = 0;
+  var amp = 1.5 + 6 * h, fr = 1.6 + 3 * h;
+  dy = -Math.abs(Math.sin(t * fr + s.phase)) * amp; rot = Math.sin(t * fr * 0.5 + s.phase) * 0.015 * (1 + 2 * h);
+  if (s.mode === 'windup') {
+    var u = Math.min(1, (now - s.t0) / s.dur), e = 1 - Math.pow(1 - u, 2), b = s.big ? 1.8 : 1;
+    sy = 1 + 0.07 * e * b; sx = 1 - 0.035 * e * b; rot = -0.07 * e * b; dy = -10 * e * b;
+    if (s.big) { rot += Math.sin(now / 25) * 0.012 * e; }
+  } else if (s.mode === 'strike') {
+    var u2 = (now - s.t0) / (s.big ? 420 : 260);
+    if (u2 >= 1) s.mode = 'idle';
+    else {
+      var b2 = s.big ? 1.6 : 1, k1 = u2 < 0.18 ? u2 / 0.18 : Math.exp(-(u2 - 0.18) * 5) * Math.cos((u2 - 0.18) * 14);
+      sy = 1 - 0.13 * k1 * b2; sx = 1 + 0.09 * k1 * b2; rot = 0.1 * k1 * b2; dy = 8 * k1 * b2;
+    }
+  }
+  var ct = (now - s.cheerT) / 1000;
+  if (ct >= 0 && ct < 1.1 && s.mode === 'idle') { var hop = Math.abs(Math.sin(ct * Math.PI * 2.7)) * (1 - ct / 1.1); dy -= 34 * hop; rot += Math.sin(ct * 18) * 0.06 * (1 - ct / 1.1); sy *= 1 + 0.04 * hop; }
+  return { sx: sx, sy: sy, rot: rot, dy: dy };
+}
+function drawSmiths() {
+  for (var i = 0; i < 4; i++) {
+    var b = smithBase(i), p = smithPose(i), s = C.smith[i];
+    // armed glow
+    if (armedMs[i]) { var pa = 0.55 + 0.35 * Math.sin(now / 140); ctx.globalCompositeOperation = 'lighter'; ctx.globalAlpha = pa; ctx.drawImage(C.glow.hot, b.x - s.w * 0.85, b.y - s.h * 1.05, s.w * 1.7, s.h * 1.1); ctx.globalCompositeOperation = 'source-over'; ctx.globalAlpha = 1; }
+    ctx.save(); ctx.translate(b.x, b.y + p.dy); ctx.rotate(p.rot); ctx.scale(p.sx, p.sy);
+    ctx.drawImage(s.c, -s.w / 2, -s.h, s.w, s.h);
+    ctx.restore();
+    // hammer smear on strike
+    var sm = smiths[i], st = (now - sm.hitT);
+    if (st >= 0 && st < 110) {
+      var hx = b.x - s.w / 2 + HAMMER_AT[i][0] * s.w, hy = b.y - s.h + HAMMER_AT[i][1] * s.h, tx = b.x, ty = reelTop - capH + 8;
+      ctx.globalCompositeOperation = 'lighter'; ctx.globalAlpha = (1 - st / 110) * (sm.big ? 0.9 : 0.6);
+      ctx.strokeStyle = sm.big ? '#fff3c0' : '#ffd9a0'; ctx.lineWidth = sm.big ? 26 : 16; ctx.lineCap = 'round';
+      ctx.beginPath(); ctx.moveTo(hx, hy); ctx.quadraticCurveTo(hx - 50, (hy + ty) / 2, tx - 10, ty); ctx.stroke();
+      ctx.globalCompositeOperation = 'source-over'; ctx.globalAlpha = 1;
+    }
+    if (armedMs[i]) txt('MASTER STRIKE', b.x, b.y - s.h - 6 + Math.sin(now / 200) * 3, 19, '#ffe08a', '#5a1d00', 'center');
+  }
+}
+
+// ---------------- reels ----------------
+var reels = [0, 1, 2, 3].map(function (r) { return { band: Lg.windowAt(r, (Math.random() * Lg.STRIPS[r].length) | 0).slice(), k: 0, D: 0, t0: 0, tS: 0, v: 0, spinning: false, landed: true, sq: 0, sqT: -9, final: null, wild: false, flash: 0 }; });
+var shownGrid = reels.map(function (re) { return re.band.slice(0, 3); });
+var landedCb = null;
+function startReels(o) {
+  var base = now + 40;
+  for (var r = 0; r < R; r++) {
+    var re = reels[r], cur = shownGrid[r], tS = base + 620 + r * 260, acc = 0.14;
+    var dur = (tS - base - r * 55) / 1000, v = 24; var D = Math.max(8, Math.round(v * (dur - acc / 2)));
+    var st = Lg.STRIPS[r], off = (Math.random() * st.length) | 0, band = [];
+    band.push(st[(off + 50) % st.length]);           // index 0: overshoot spare
+    for (var y = 0; y < 3; y++) band.push(o.pre[r][y]);  // final window at 1..3
+    for (var i = 0; i < D - 3; i++) band.push(st[(off + i) % st.length]);
+    for (y = 0; y < 3; y++) band.push(cur[y]);           // current window at the end
+    re.band = band; re.D = band.length - 4; re.t0 = base + r * 55; re.tS = tS; re.acc = acc; re.v = re.D / ((tS - re.t0) / 1000 - acc / 2);
+    re.spinning = true; re.landed = false; re.final = o.grid[r]; re.wild = false; re.k = re.D;
+  }
+  anticip = -1;
+}
+function reelPos(re) { // returns k (top visible band index offset from 1)
+  if (!re.spinning) return 0;
+  var t = (now - re.t0) / 1000, tt = (re.tS - re.t0) / 1000;
+  if (t <= 0) return re.D;
+  if (t >= tt) return 0;
+  var a = re.acc, d = t < a ? 0.5 * re.v / a * t * t : 0.5 * re.v * a + re.v * (t - a);
+  return Math.max(0, re.D - d);
+}
+function updReels() {
+  for (var r = 0; r < R; r++) {
+    var re = reels[r];
+    // smith windup ahead of stop
+    if (re.spinning && !re.landed) {
+      var msHere = outcome && outcome.ms[r], wl = msHere ? 520 : 200;
+      if (smiths[r].mode !== 'windup' && now >= re.tS - wl && !skip) smithWindup(r, wl, msHere);
+      if (now >= re.tS) landReel(r);
+    }
+  }
+}
+function landReel(r) {
+  var re = reels[r], o = outcome; re.landed = true; re.spinning = false; re.k = 0;
+  var big = !!o.ms[r];
+  re.sqT = now; re.sqBig = big;
+  smithStrike(r, big);
+  var cx = colX(r) + colW / 2, cy = reelTop - capH + 6;
+  heat[r] = Math.min(1, heat[r] + 0.105 + Math.random() * 0.02);
+  if (big) {
+    re.wild = true; heat[r] = 1; re.flash = 1; shake = Math.max(shake, skip ? 8 : 22); flashA = skip ? 0.15 : 0.45;
+    sparks(cx, cy, 70, 1.5, 3.4); sparks(cx, reelTop + cellH * 1.5, 30, 1.1, 6.2); star(cx, reelTop + cellH * 1.5, 24);
+    SFX.strikeBig();
+    if (!skip) bannerShow('MASTER STRIKE!', '', 1100, '#fff1b8', r, reelTop - capH - 75);
+  } else {
+    sparks(cx, cy, Math.round(10 + 30 * heat[r]), 0.7 + 0.6 * heat[r]);
+    shake = Math.max(shake, 2 + 3 * heat[r]);
+    SFX.clink(0.7 + 0.4 * heat[r], 0.9 + r * 0.06); SFX.thud(0.6);
+  }
+  if (Lg.windowAt(r, o.stops[r]).indexOf(S.ANVIL) >= 0 && !big) { SFX.anvil(); }
+  shownGrid[r] = o.grid[r].slice();
+  // MS: give the next reels a beat
+  if (big && !skip) for (var j = r + 1; j < R; j++) { if (!reels[j].landed) { reels[j].tS += 380; } }
+  // anticipation: 2 anvils down with reels to go
+  var an = 0, rem = 0; for (j = 0; j < R; j++) { if (reels[j].landed) { if (o.grid[j].indexOf(S.ANVIL) >= 0) an++; } else rem++; }
+  if (an === 2 && rem > 0 && anticip < 0 && !skip) {
+    anticip = r + 1; SFX.rumble(1.2 * rem);
+    for (var q = 0, j2 = r + 1; j2 < R; j2++) if (!reels[j2].landed) { reels[j2].tS += 1100 + 700 * (q++); }
+  }
+  if (anticip >= 0) { for (j = 0; j < R; j++) if (!reels[j].landed) { anticip = j; break; } if (rem === 0) anticip = -1; }
+  if (reels.every(function (q) { return q.landed; })) { anticip = -1; if (landedCb) { var cb = landedCb; landedCb = null; cb(); } }
+}
+function skipReels() {
+  var k = 0;
+  for (var r = 0; r < R; r++) if (!reels[r].landed) { reels[r].tS = Math.min(reels[r].tS, now + 20 + 45 * (k++)); reels[r].t0 = Math.min(reels[r].t0, now - 1); }
+}
+function cellsOf(r) { return shownGrid[r]; }
+function drawSym(id, x, y, scale, blur, alpha) {
+  var s = C.symSize * (scale || 1);
+  if (alpha != null) ctx.globalAlpha = alpha;
+  if (blur) { var b = C.symBlur[id]; ctx.drawImage(b, x - s / 2, y - s * 0.75, s, s * 1.5); }
+  else ctx.drawImage(C.sym[id], x - s / 2, y - s / 2, s, s);
+  if (alpha != null) ctx.globalAlpha = 1;
+}
+function drawReels() {
+  for (var r = 0; r < R; r++) {
+    var re = reels[r], x = colX(r), h = vheat(r), col = heatRGB(h), rgb = col[0] + ',' + col[1] + ',' + col[2];
+    var top = reelTop, H3 = cellH * 3;
+    // heat interior glow: hot edges, centre stays a dark ember tone for readability
+    var cc = heatRGB(Math.min(h, 0.58)), crgb = cc[0] + ',' + cc[1] + ',' + cc[2];
+    var gi = ctx.createLinearGradient(0, top, 0, top + H3);
+    var ea = 0.1 + 0.62 * h, ca = 0.04 + 0.26 * h;
+    gi.addColorStop(0, 'rgba(' + rgb + ',' + ea + ')'); gi.addColorStop(0.2, 'rgba(' + crgb + ',' + ca + ')'); gi.addColorStop(0.8, 'rgba(' + crgb + ',' + ca + ')'); gi.addColorStop(1, 'rgba(' + rgb + ',' + Math.min(1, ea * 1.15) + ')');
+    ctx.fillStyle = gi; rr(ctx, x + 3, top + 2, colW - 6, H3 - 4, 13); ctx.fill();
+    if (h > 0.55) { // side glow strips
+      var gs = ctx.createLinearGradient(x, 0, x + colW, 0), sa = (h - 0.55) * 0.9;
+      gs.addColorStop(0, 'rgba(' + rgb + ',' + sa + ')'); gs.addColorStop(0.16, 'rgba(' + rgb + ',0)'); gs.addColorStop(0.84, 'rgba(' + rgb + ',0)'); gs.addColorStop(1, 'rgba(' + rgb + ',' + sa + ')');
+      ctx.fillStyle = gs; ctx.fillRect(x + 3, top + 2, colW - 6, H3 - 4);
+    }
+    // squash spring
+    var sqt = (now - re.sqT) / 1000, sq = sqt >= 0 && sqt < 0.5 ? Math.exp(-sqt * 9) * Math.cos(sqt * 34) * (re.sqBig ? 1.8 : 1) : 0;
+    ctx.save(); rr(ctx, x + 3, top + 2, colW - 6, H3 - 4, 13); ctx.clip();
+    ctx.translate(x + colW / 2, top); ctx.scale(1 + 0.035 * sq, 1 - 0.05 * sq); ctx.translate(-(x + colW / 2), -top);
+    if (bon) drawBonusReel(r);
+    else {
+      var k = re.spinning ? reelPos(re) : 0, fast = re.spinning && (now - re.t0) > 60 && k > 1.2;
+      var i0 = Math.floor(k), fr = k - i0;
+      var bounce = 0;
+      if (!re.spinning) { var bt = (now - re.sqT) / 1000; if (bt >= 0 && bt < 0.25) bounce = Math.sin(bt / 0.25 * Math.PI) * 0.14 * (1 - bt / 0.25); }
+      for (var j = -1; j < 4; j++) {
+        var idx = i0 + 1 + j;
+        if (re.spinning ? (idx < 0 || idx >= re.band.length) : (j < 0 || j > 2)) continue;
+        var yy = top + (j - fr + bounce) * cellH + cellH / 2;
+        if (yy < top - cellH || yy > top + H3 + cellH) continue;
+        var sid;
+        if (!re.spinning && j >= 0 && j < 3) sid = shownGrid[r][j];
+        else sid = re.band[idx];
+        var inWin = winFx && winFx.cells[r * 3 + j], dim = winFx && !inWin && !re.spinning && j >= 0 && j < 3;
+        var pul = inWin ? 1 + 0.07 * Math.sin((now - winFx.t0) / 120) : 1;
+        if (inWin) { ctx.globalCompositeOperation = 'lighter'; ctx.globalAlpha = 0.5 + 0.25 * Math.sin((now - winFx.t0) / 120); ctx.drawImage(C.glow.gold, x + colW / 2 - colW * 0.6, yy - cellH * 0.6, colW * 1.2, cellH * 1.2); ctx.globalAlpha = 1; ctx.globalCompositeOperation = 'source-over'; }
+        drawSym(sid, x + colW / 2, yy, pul * (sid === S.WILD ? 1.04 : 1), fast, dim ? 0.38 : null);
+      }
+      if (re.flash > 0) { ctx.globalCompositeOperation = 'lighter'; ctx.globalAlpha = re.flash; ctx.fillStyle = '#fff4d0'; ctx.fillRect(x, top, colW, H3); ctx.globalAlpha = 1; ctx.globalCompositeOperation = 'source-over'; }
+    }
+    ctx.restore();
+    // glowing frame edge
+    if (h > 0.5) { ctx.globalCompositeOperation = 'lighter'; ctx.globalAlpha = (h - 0.5) * 0.5 * (0.85 + 0.15 * Math.sin(now / 130 + r * 2)); ctx.drawImage(h > 0.85 ? C.glow.gold : C.glow.hot, x - 46, top - capH - 50, colW + 92, H3 + capH + 100); ctx.globalAlpha = 1; ctx.globalCompositeOperation = 'source-over'; }
+    ctx.lineWidth = 3 + 3 * h; ctx.strokeStyle = 'rgba(' + rgb + ',' + (0.35 + 0.6 * h) + ')';
+    rr(ctx, x + 1, top, colW - 2, H3, 14); ctx.stroke();
+    // forge mouth (heat window on the cap)
+    var mx = x + 22, my = top - capH + 6, mw = colW - 44, mh = capH - 12;
+    var gm = ctx.createLinearGradient(0, my + mh, 0, my);
+    gm.addColorStop(0, 'rgba(' + rgb + ',' + (0.4 + 0.6 * h) + ')'); gm.addColorStop(1, 'rgba(' + rgb + ',' + (0.1 + 0.5 * h * h) + ')');
+    ctx.fillStyle = gm; rr(ctx, mx, my, mw, mh, 10); ctx.fill();
+    if (h > 0.25) { ctx.globalCompositeOperation = 'lighter'; ctx.globalAlpha = Math.min(1, (h - 0.25) * 1.4) * (0.75 + 0.25 * Math.sin(now / 90 + r)); ctx.drawImage(h > 0.8 ? C.glow.white : C.glow.hot, mx - 20, my - 30, mw + 40, mh + 60); ctx.globalAlpha = 1; ctx.globalCompositeOperation = 'source-over'; }
+    // anticipation glow
+    if (anticip === r) { ctx.globalCompositeOperation = 'lighter'; ctx.globalAlpha = 0.5 + 0.3 * Math.sin(now / 70); ctx.drawImage(C.glow.gold, x - 40, top - 40, colW + 80, H3 + 80); ctx.globalAlpha = 1; ctx.globalCompositeOperation = 'source-over'; }
+    if (re.flash > 0) re.flash = Math.max(0, re.flash - 0.035);
+  }
+}
+
+// ---------------- bonus display ----------------
+function vlabel(v) {
+  var key = 'v' + v; if (C.labels[key]) return C.labels[key];
+  var str = fmt(v * BET), fs = str.length > 4 ? 30 : 36, w = colW, h = 50, c = mk(PX(w), PX(h)), g = c.getContext('2d');
+  g.scale(K * DPR, K * DPR); g.font = fs + 'px ' + FONT; g.textAlign = 'center'; g.textBaseline = 'middle';
+  g.lineJoin = 'round'; g.lineWidth = 7; g.strokeStyle = '#5a2a00'; g.strokeText(str, w / 2, h / 2); g.fillStyle = '#fff6d6'; g.fillText(str, w / 2, h / 2);
+  C.labels[key] = { c: c, w: w, h: h }; return C.labels[key];
+}
+function drawBonusReel(r) {
+  var x = colX(r), top = reelTop;
+  for (var y = 0; y < 3; y++) {
+    var i = r * 3 + y, cy = top + y * cellH + cellH / 2, cx = x + colW / 2, cell = bon.cells[i];
+    if (!cell.kind) {
+      // empty slot; flicker while respinning
+      ctx.fillStyle = 'rgba(40,20,10,0.55)'; rr(ctx, x + 12, cy - cellH / 2 + 10, colW - 24, cellH - 20, 12); ctx.fill();
+      if (bon.spinning) { var f = (Math.sin(now / 45 + i * 1.7) + 1) / 2; drawSym(SYM_INGOT, cx, cy + ((now / 3 + i * 40) % cellH) - cellH / 2, 0.75, true, 0.15 + 0.2 * f); }
+      continue;
+    }
+    var pt = (now - cell.t) / 1000, pop = pt < 0.35 ? 1 + 0.35 * Math.sin(pt / 0.35 * Math.PI) * (1 - pt / 0.35) : 1;
+    var forged = bon.forged[r];
+    drawSym(cell.kind === 2 ? SYM_MH : SYM_INGOT, cx, cy - 4, pop * 0.92, false, forged ? 0.45 : null);
+    var lb = vlabel(cell.v), ls = pop * (cell.dbl && now - cell.dbl < 400 ? 1.35 - (now - cell.dbl) / 400 * 0.35 : 1);
+    ctx.drawImage(lb.c, cx - lb.w * ls / 2, cy + 18 - lb.h * ls / 2, lb.w * ls, lb.h * ls);
+  }
+  if (bon.forged[r]) {
+    var ft = (now - bon.forgedT[r]) / 1000, a = Math.min(1, ft * 3), sc = ft < 0.4 ? 1.25 - 0.25 * ft / 0.4 : 1;
+    ctx.globalCompositeOperation = 'lighter'; ctx.globalAlpha = 0.6 * a; ctx.drawImage(C.glow.gold, x - 30, top - 20, colW + 60, cellH * 3 + 40); ctx.globalCompositeOperation = 'source-over';
+    ctx.globalAlpha = a; ctx.save(); ctx.translate(x + colW / 2, top + cellH * 1.5); ctx.scale(sc, sc); ctx.drawImage(C.sword, -colW / 2, -cellH * 1.5, colW, cellH * 3); ctx.restore();
+    var sum = bon.cells[r * 3].v + bon.cells[r * 3 + 1].v + bon.cells[r * 3 + 2].v;
+    txt('FORGED', x + colW / 2, top + cellH * 0.55, 28, '#fff2b0', '#6b2600', 'center');
+    txt(fmt(sum * BET), x + colW / 2, top + cellH * 2.55, 34, '#ffffff', '#6b2600', 'center');
+    ctx.globalAlpha = 1;
+  }
+}
+function drawBonusHud() {
+  var y = reelTop + cellH * 3 + 26, names = ['MINI', 'MINOR', 'MAJOR', 'GRAND'], vals = [20, 50, 200, 1000];
+  var nf = bon.forged.reduce(function (a, b) { return a + b; }, 0);
+  for (var i = 0; i < 4; i++) {
+    var x = colX(i), lit = nf === i + 1, got = nf > i;
+    ctx.fillStyle = lit ? 'rgba(255,190,60,0.95)' : got ? 'rgba(160,90,30,0.85)' : 'rgba(30,18,12,0.8)';
+    rr(ctx, x + 4, y, colW - 8, 54, 12); ctx.fill();
+    ctx.lineWidth = 2; ctx.strokeStyle = lit ? '#fff3c4' : '#7a5a3a'; ctx.stroke();
+    txt(names[i], x + colW / 2, y + 19, 18, lit ? '#5a2000' : '#ffd27a', lit ? null : '#2a1000', 'center');
+    txt(fmt(vals[i] * BET), x + colW / 2, y + 41, 20, lit ? '#3a1200' : '#fff', lit ? null : '#2a1000', 'center');
+  }
+  var rs = bon.respins, pulse = now - bon.respinT < 400 ? 1 + 0.3 * (1 - (now - bon.respinT) / 400) : 1;
+  if (state === 'bonus' || state === 'bonusEnd') txt(state === 'bonusEnd' ? 'FORGE COMPLETE' : 'RESPINS  ' + rs, Lw / 2, y + 90, 30 * pulse, '#ffe7a8', '#4a1600', 'center');
+}
+
+// ---------------- text helpers ----------------
+function fmt(n) { return Math.round(n).toString().replace(/\B(?=(\d{3})+(?!\d))/g, ','); }
+function txt(s, x, y, size, fill, stroke, align) {
+  ctx.font = size + 'px ' + FONT; ctx.textAlign = align || 'left'; ctx.textBaseline = 'middle';
+  if (stroke) { ctx.lineJoin = 'round'; ctx.lineWidth = Math.max(3, size * 0.2); ctx.strokeStyle = stroke; ctx.strokeText(s, x, y); }
+  ctx.fillStyle = fill; ctx.fillText(s, x, y);
+}
+function bannerShow(text, sub, dur, color, reel, y) { banner = { text: text, sub: sub || '', t0: now, dur: dur, color: color || '#fff1b8', reel: reel, y: y }; }
+function drawBanner() {
+  if (!banner) return;
+  var u = (now - banner.t0) / banner.dur; if (u >= 1 && banner.dur > 0) { banner = null; return; }
+  var a = Math.min(1, (now - banner.t0) / 120), s = (now - banner.t0) < 250 ? 0.6 + 0.4 * Math.sin((now - banner.t0) / 250 * Math.PI / 2) * 1.1 : 1;
+  if (banner.dur > 0 && u > 0.85) a = (1 - u) / 0.15;
+  var y = banner.y != null ? banner.y : reelTop + cellH * 1.5;
+  ctx.globalAlpha = a;
+  ctx.fillStyle = 'rgba(20,8,2,0.62)'; rr(ctx, 20, y - 70, Lw - 40, banner.sub ? 150 : 110, 26); ctx.fill();
+  ctx.save(); ctx.translate(Lw / 2, y - (banner.sub ? 22 : 15)); ctx.scale(s, s);
+  txt(banner.text, 0, 0, banner.text.length > 12 ? 58 : 70, banner.color, '#6a1e00', 'center');
+  ctx.restore();
+  if (banner.sub) txt(banner.sub, Lw / 2, y + 42, 50, '#ffffff', '#6a1e00', 'center');
+  ctx.globalAlpha = 1;
+}
+function drawTop() {
+  var key = fmt(shownBal) + '|' + fmt(shownWin);
+  if (key !== C.topKey || !C.top) {
+    C.topKey = key; var h = 56, c = C.top || mk(PX(Lw), PX(h)), g = c.getContext('2d');
+    g.setTransform(K * DPR, 0, 0, K * DPR, 0, 0); g.clearRect(0, 0, Lw, h);
+    var gr = g.createLinearGradient(0, 0, 0, h); gr.addColorStop(0, 'rgba(18,10,6,0.92)'); gr.addColorStop(1, 'rgba(18,10,6,0.72)');
+    g.fillStyle = gr; g.fillRect(0, 0, Lw, h); g.fillStyle = 'rgba(255,170,70,0.5)'; g.fillRect(0, h - 2, Lw, 2);
+    g.textBaseline = 'middle'; g.font = '22px ' + FONT; g.fillStyle = '#d9a35a'; g.textAlign = 'left'; g.fillText('BALANCE', 18, h / 2 + 1);
+    g.font = '30px ' + FONT; g.fillStyle = '#ffe9b0'; g.fillText(fmt(shownBal), 128, h / 2 + 1);
+    g.font = '22px ' + FONT; g.fillStyle = '#d9a35a'; g.textAlign = 'right'; var wv = fmt(shownWin); g.font = '30px ' + FONT; var ww = g.measureText(wv).width;
+    g.fillStyle = shownWin > 0 ? '#ffd23c' : '#ffe9b0'; g.fillText(wv, Lw - 18, h / 2 + 1); g.font = '22px ' + FONT; g.fillStyle = '#d9a35a'; g.fillText('WIN', Lw - 28 - ww, h / 2 + 1);
+    C.top = c;
+  }
+  ctx.drawImage(C.top, 0, 0, Lw, 56);
+}
+
+// ---------------- furnace ----------------
+function furnaceC() { return { x: bgX + 360 * sb, y: 352 * sb, rx: 110 * sb, ry: 100 * sb }; }
+function drawFurnace() {
+  var f = furnaceC(), h = avgHeat(), fl = 0.6 + 0.4 * Math.sin(now / 110) * Math.sin(now / 47 + 1);
+  ctx.globalCompositeOperation = 'lighter';
+  ctx.globalAlpha = Math.min(1, 0.12 + 0.45 * h + 0.08 * fl + (armedBonus ? 0.35 + 0.25 * Math.sin(now / 120) : 0));
+  ctx.drawImage(armedBonus ? C.glow.gold : C.glow.hot, f.x - f.rx * 1.7, f.y - f.ry * 1.7, f.rx * 3.4, f.ry * 3.4);
+  ctx.globalAlpha = 1; ctx.globalCompositeOperation = 'source-over';
+  if (Math.random() < 0.06 + 0.4 * h) ember(f.x + (Math.random() - 0.5) * f.rx, f.y + f.ry * 0.3);
+  if (armedBonus) txt('FORGE BONUS ARMED', f.x, f.y - f.ry - 12, 24, '#ffe08a', '#5a1d00', 'center');
+}
+
+// ---------------- main loop ----------------
+var waits = [];
+function wait(ms) { return new Promise(function (res) { if (skip) { res(); return; } waits.push({ t: now + ms, res: res }); }); }
+function flushWaits(all) { for (var i = waits.length - 1; i >= 0; i--) if (all || now >= waits[i].t) { var w = waits[i]; waits.splice(i, 1); w.res(); } }
+var last = performance.now(), fpsN = 0, fpsT = 0, fps = 60;
+function frame(t) {
+  requestAnimationFrame(frame);
+  now = t; var dt = Math.min(0.05, (t - last) / 1000); last = t;
+  fpsN++; if (t - fpsT > 1000) { fps = fpsN * 1000 / (t - fpsT); fpsN = 0; fpsT = t; }
+  if (state === 'load') return;
+  flushWaits(false);
+  updReels();
+  // heat cooling (cosmetic)
+  var busy = state === 'spin' || state === 'bonus' || state === 'bonusEnd';
+  if (busy) lastActive = now;
+  if (!busy && now - lastActive > 450) {
+    for (var r = 0; r < R; r++) if (heat[r] > 0) {
+      var was = heat[r]; heat[r] = Math.max(0, heat[r] - dt * 0.2);
+      if (was > 0.18 && now - coolingPuffT[r] > 700 + 900 * (1 - was)) { coolingPuffT[r] = now; steam(colX(r) + colW / 2, reelTop - capH + 4, 2 + Math.round(4 * was)); if (r === 0 || Math.random() < 0.3) SFX.sizzle(was); }
+    }
+  }
+  bonusHeat += (bonusHeatTarget - bonusHeat) * Math.min(1, dt * 3);
+  for (r = 0; r < R; r++) { var hh = vheat(r); if (hh > 0.45 && Math.random() < (hh - 0.45) * 0.5) ember(colX(r) + 20 + Math.random() * (colW - 40), reelTop - capH + 10); }
+  updParticles(dt);
+  // count-up driver
+  if (counter) {
+    var u = Math.min(1, (now - counter.t0) / counter.dur); if (skip) u = 1;
+    var v = counter.from + (counter.to - counter.from) * (1 - Math.pow(1 - u, 2));
+    shownWin = Math.round(v); shownBal = counter.bal0 + Math.round(v - counter.from);
+    if (Math.floor(v / Math.max(1, counter.step)) !== counter.lastTick) { counter.lastTick = Math.floor(v / Math.max(1, counter.step)); SFX.tick(counter.lastTick); }
+    if (u >= 1) { shownWin = counter.to; shownBal = counter.bal0 + counter.to - counter.from; var cb = counter.cb; counter = null; cb(); }
+  }
+  draw(dt);
+}
+function draw(dt) {
+  ctx.setTransform(1, 0, 0, 1, 0, 0);
+  ctx.drawImage(C.static, 0, 0);
+  var sx = 0, sy = 0; if (shake > 0.3) { sx = (Math.random() - 0.5) * shake; sy = (Math.random() - 0.5) * shake; shake *= Math.pow(0.002, dt); } else shake = 0;
+  if (sx || sy) { // re-blit the column shaken (static content inside the column)
+    ctx.save(); ctx.beginPath(); ctx.rect(OX * DPR, OY * DPR, Lw * K * DPR, Lh * K * DPR); ctx.clip(); ctx.drawImage(C.static, sx * K * DPR, sy * K * DPR); ctx.restore();
+  }
+  ctx.setTransform(K * DPR, 0, 0, K * DPR, (OX + sx * K) * DPR, (OY + sy * K) * DPR);
+  ctx.save(); ctx.beginPath(); ctx.rect(-30, 0, Lw + 60, Lh); ctx.clip();
+  drawFurnace();
+  drawSmiths();
+  drawReels();
+  if (bon) drawBonusHud();
+  else if (labelText && state !== 'spin') { var la = Math.min(1, (now - labelT) / 200); ctx.globalAlpha = la; txt(labelText, Lw / 2, reelTop + cellH * 3 + 46, 30, '#ffe7a8', '#3a1200', 'center'); ctx.globalAlpha = 1; }
+  drawParticles();
+  if (flashA > 0.01) { ctx.globalAlpha = flashA; ctx.fillStyle = '#fff6dc'; ctx.fillRect(0, 0, Lw, Lh); ctx.globalAlpha = 1; flashA *= Math.pow(0.004, dt); }
+  drawBanner();
+  ctx.restore();
+  ctx.setTransform(K * DPR, 0, 0, K * DPR, OX * DPR, OY * DPR);
+  drawTop();
+}
+
+// ---------------- flows ----------------
+var counter = null;
+function countUp(from, to, bal0) {
+  return new Promise(function (res) {
+    if (to <= from) { shownWin = to; res(); return; }
+    var d = to - from, xb = d / BET, dur = Math.min(3200, 350 + 140 * Math.sqrt(xb) * 4);
+    counter = { from: from, to: to, t0: now, dur: dur, bal0: bal0, step: Math.max(1, Math.round(d / 25)), lastTick: -1, cb: res };
+  });
+}
+function setWinFx(o) {
+  var cells = {}, any = false;
+  o.wins.forEach(function (w) { for (var r = 0; r < w.len; r++) for (var y = 0; y < 3; y++) { var s = o.grid[r][y]; if (s === w.sym || s === S.WILD) { cells[r * 3 + y] = 1; any = true; } } });
+  winFx = any ? { cells: cells, wins: o.wins, t0: now } : null;
+}
+var labelCycle = null;
+function startLabels(o) {
+  var items = o.wins.slice().sort(function (a, b) { return b.win - a.win; }).map(function (w) { return w.len + ' × ' + Lg.NAMES[w.sym].toUpperCase() + '  ·  ' + w.ways + (w.ways > 1 ? ' WAYS' : ' WAY') + '  ·  ' + fmt(w.win); });
+  if (!items.length) return; var i = 0; labelText = items[0]; labelT = now;
+  if (labelCycle) clearInterval(labelCycle);
+  if (items.length > 1) labelCycle = setInterval(function () { if (state === 'spin' || bon) return; i = (i + 1) % items.length; labelText = items[i]; labelT = now; }, 1300);
+}
+function clearWin() { winFx = null; labelText = ''; if (labelCycle) { clearInterval(labelCycle); labelCycle = null; } }
+
+async function baseSpin() {
+  state = 'spin'; skip = false; clearWin(); banner = null;
+  var useCheat = armedBonus || armedMs.some(Boolean), cheat = useCheat ? { ms: armedMs.slice(), bonus: !!armedBonus } : null;
+  armedMs = [0, 0, 0, 0]; armedBonus = 0;
+  var o = Lg.spin(rng, cheat); outcome = o; spinNo++;
+  var bal0 = balance; balance -= BET; balance += o.total;
+  shownBal = bal0 - BET; shownWin = 0;
+  updateDebug('decided');
+  SFX.whoosh();
+  var landed = new Promise(function (res) { landedCb = res; });
+  startReels(o);
+  await landed;
+  if (o.lineWin > 0) {
+    state = 'present'; setWinFx(o); startLabels(o);
+    for (var r = 0; r < R; r++) smithCheer(r, r * 90);
+    if (o.lineWin >= 20 * BET && !skip) { bannerShow(o.lineWin >= 50 * BET ? 'MEGA WIN' : 'BIG WIN', fmt(o.lineWin), 2200, '#ffd84a'); SFX.fanfare(true); } else SFX.coin(1);
+    await countUp(0, o.lineWin, bal0 - BET);
+  }
+  if (o.bonus) await bonusFlow(o, bal0 - BET + o.lineWin);
+  shownWin = o.total; shownBal = balance;
+  verify(o);
+  state = 'idle'; skip = false; lastActive = now;
+}
+async function bonusFlow(o, balBefore) {
+  var B = o.bonus;
+  state = 'bonus'; skip = false; banner = null;
+  // anvils celebrate
+  for (var a = 0; a < o.anvils.length; a++) { var c = o.anvils[a], r = (c / 3) | 0; reels[r].sqT = now; smithCheer(r, a * 80); sparks(colX(r) + colW / 2, reelTop + (c % 3) * cellH + cellH / 2, 16, 0.8); }
+  SFX.anvil();
+  await wait(700);
+  bannerShow('FORGE BONUS', '3 RESPINS', 1700, '#ffdd66'); SFX.fanfare(true);
+  bonusHeatTarget = 1;
+  await wait(1500);
+  clearWin();
+  bon = { cells: [], forged: [0, 0, 0, 0], forgedT: [0, 0, 0, 0], respins: Lg.B_RESPINS, respinT: now, spinning: false };
+  for (var i = 0; i < 12; i++) bon.cells.push({ kind: 0, v: 0, t: 0, dbl: 0 });
+  for (i = 0; i < B.init.length; i++) {
+    var it = B.init[i], rr_ = (it.c / 3) | 0; bon.cells[it.c] = { kind: 1, v: it.v, t: now, dbl: 0 };
+    smithStrike(rr_, false); sparks(colX(rr_) + colW / 2, reelTop + (it.c % 3) * cellH + cellH / 2, 20, 0.9); SFX.clink(1, 1.1); SFX.coin(1);
+    await wait(260);
+  }
+  await wait(400);
+  for (var s = 0; s < B.steps.length; s++) {
+    var st = B.steps[s];
+    bon.spinning = true; SFX.whoosh();
+    await wait(620);
+    bon.spinning = false;
+    for (r = 0; r < R; r++) {
+      var lands = st.lands.filter(function (l) { return ((l.c / 3) | 0) === r; });
+      if (!lands.length) continue;
+      for (var l = 0; l < lands.length; l++) {
+        var L_ = lands[l]; bon.cells[L_.c] = { kind: L_.h ? 2 : 1, v: L_.v, t: now, dbl: 0 };
+        smithStrike(r, false); reels[r].sqT = now; reels[r].sqBig = false;
+        sparks(colX(r) + colW / 2, reelTop + (L_.c % 3) * cellH + cellH / 2, 18, 0.8); SFX.clink(1, 1 + 0.1 * r); SFX.coin(1 + 0.05 * s);
+      }
+      await wait(260);
+      var hams = st.hammers.filter(function (h) { return h.r === r; });
+      for (var hI = 0; hI < hams.length; hI++) {
+        var hm = hams[hI];
+        smithWindup(r, 420, true); if (!skip) bannerShow('DOUBLE!', '', 900, '#ffe27a', r, reelTop - capH - 75);
+        await wait(440);
+        smithStrike(r, true); reels[r].sqT = now; reels[r].sqBig = true; shake = Math.max(shake, skip ? 4 : 16); SFX.strikeBig();
+        for (var y = 0; y < 3; y++) { var ce = bon.cells[r * 3 + y]; if (ce.kind) { ce.v = hm.after[y]; ce.dbl = now; star(colX(r) + colW / 2, reelTop + y * cellH + cellH / 2, 10); } }
+        bon.cells[hm.c].kind = 1;
+        sparks(colX(r) + colW / 2, reelTop - capH + 6, 50, 1.3, 3.2);
+        await wait(650);
+      }
+    }
+    for (var f = 0; f < st.forged.length; f++) {
+      var fr = st.forged[f];
+      smithWindup(fr, 380, true);
+      await wait(400);
+      smithStrike(fr, true); bon.forged[fr] = 1; bon.forgedT[fr] = now; shake = Math.max(shake, skip ? 4 : 20); flashA = skip ? 0.1 : 0.35;
+      sparks(colX(fr) + colW / 2, reelTop + cellH * 1.5, 60, 1.4, 6.2); star(colX(fr) + colW / 2, reelTop + cellH * 1.5, 30); SFX.forge();
+      for (r = 0; r < R; r++) smithCheer(r, r * 70);
+      await wait(1000);
+    }
+    if (st.respinsAfter === Lg.B_RESPINS && st.lands.length) { bon.respinT = now; }
+    bon.respins = st.respinsAfter;
+    await wait(380);
+  }
+  bon.respins = 0;
+  await wait(500);
+  // jackpot + count-up
+  var nf = B.nForged;
+  if (nf > 0) {
+    if (!skip) { bannerShow(B.jpName + ' JACKPOT', fmt(B.jackpot * BET), 2000, '#ffd84a'); SFX.fanfare(true); for (r = 0; r < R; r++) smithCheer(r, r * 80); star(Lw / 2, reelTop + cellH * 1.5, 50); }
+    await wait(2100);
+  }
+  await countUp(o.lineWin, o.lineWin + B.win, balBefore);
+  // end screen: shows until tap (or 6 s)
+  skip = false; state = 'bonusEnd';
+  shownWin = o.total; shownBal = balBefore + B.win;
+  bannerShow('FORGE WIN', fmt(B.win) + (nf ? '' : ''), 0, '#ffe066');
+  if (nf) banner.text = B.jpName + ' + FORGE WIN';
+  for (r = 0; r < R; r++) smithCheer(r, r * 90);
+  SFX.fanfare(false);
+  FM.bonusShown = { vals: bon.cells.map(function (c) { return c.kind ? c.v : 0; }), forged: bon.forged.slice(), win: shownWin };
+  await new Promise(function (res) { endWaiter = res; setTimeout(function () { if (endWaiter === res) { endWaiter = null; res(); } }, 6000); });
+  banner = null; bon = null; bonusHeatTarget = 0;
+  for (r = 0; r < R; r++) heat[r] = 1; // the field leaves the bonus white-hot and cools down
+}
+var endWaiter = null;
+
+function verify(o) {
+  var gridOk = true;
+  for (var r = 0; r < R; r++) for (var y = 0; y < 3; y++) if (shownGrid[r][y] !== o.grid[r][y]) gridOk = false;
+  var rec = { n: spinNo, gridOk: gridOk, win: shownWin, want: o.total, winOk: shownWin === o.total, balOk: shownBal === balance, ms: o.msCount, bonus: !!o.bonus };
+  if (o.bonus && FM.bonusShown) { var b = FM.bonusShown; rec.bonusOk = b.vals.join() === o.bonus.vals.join() && b.forged.join() === o.bonus.forged.join(); }
+  history.push(rec); if (history.length > 5000) history.shift();
+  updateDebug('shown', rec);
+}
+
+// ---------------- input ----------------
+function toLogical(e) { return { x: (e.clientX - OX) / K, y: (e.clientY - OY) / K }; }
+function hitSmith(p) {
+  for (var i = 0; i < 4; i++) {
+    var b = smithBase(i), s = C.smith[i], u = (p.x - (b.x - s.w / 2)) / s.w, v = (p.y - (b.y - s.h)) / s.h;
+    if (u < 0 || u >= 1 || v < 0 || v >= 1) continue;
+    var mx = Math.floor(u * s.mw), my = Math.floor(v * s.mh);
+    for (var dy = -1; dy <= 1; dy++) for (var dx = -1; dx <= 1; dx++) { var xx = mx + dx, yy = my + dy; if (xx >= 0 && yy >= 0 && xx < s.mw && yy < s.mh && s.mask[yy * s.mw + xx]) return i; }
+  }
+  return -1;
+}
+function hitFurnace(p) { var f = furnaceC(), dx = (p.x - f.x) / f.rx, dy = (p.y - f.y) / f.ry; return dx * dx + dy * dy <= 1; }
+function onTap(e) {
+  SFX.unlock();
+  if (state === 'load') return;
+  if (state === 'spin') { if (!skip) { skip = true; flushWaits(true); skipReels(); } return; }
+  if (state === 'present' || state === 'bonus') { skip = true; flushWaits(true); return; }
+  if (state === 'bonusEnd') { if (endWaiter) { var w = endWaiter; endWaiter = null; w(); } return; }
+  // idle: cheats or spin
+  var p = toLogical(e), si = hitSmith(p);
+  if (si >= 0) { armedMs[si] ^= 1; SFX.clink(0.5, 1.4); smithCheer(si); updateDebug('armed'); return; }
+  if (hitFurnace(p)) { armedBonus ^= 1; SFX.sizzle(0.6); updateDebug('armed'); return; }
+  if (balance < BET) balance += 10000; // prototype: auto top-up
+  baseSpin();
+}
+cv.addEventListener('pointerdown', function (e) { e.preventDefault(); onTap(e); });
+window.addEventListener('keydown', function (e) { if (e.code === 'Space' || e.code === 'Enter') { e.preventDefault(); onTap({ clientX: -1e4, clientY: -1e4 }); } });
+window.addEventListener('resize', function () { if (state !== 'load') layout(); });
+
+// ---------------- debug ----------------
+function nm(s) { return Lg.NAMES[s].slice(0, 5); }
+function updateDebug(why, rec) {
+  if (!DEBUG) return;
+  dbgEl.style.display = 'block';
+  var o = outcome, s = 'seed ' + SEED + '  spin #' + spinNo + '  fps ' + fps.toFixed(0) + '\narmed: MS[' + armedMs.join('') + '] bonus ' + armedBonus;
+  if (o) {
+    s += '\n-- pre-decided --\nstops ' + o.stops.join(',') + (o.cheat ? '  (CHEAT)' : '') + '\nMS reels: ' + (o.msCount ? o.ms.map(function (v, i) { return v ? i + 1 : ''; }).join('') : '-');
+    for (var y = 0; y < 3; y++) s += '\n' + o.grid.map(function (c) { return (nm(c[y]) + '     ').slice(0, 6); }).join('');
+    s += '\nlines ' + o.lineWin + (o.wins.length ? ' (' + o.wins.map(function (w) { return nm(w.sym) + w.len + 'x' + w.ways; }).join(' ') + ')' : '');
+    if (o.bonus) { var B = o.bonus; s += '\nBONUS: ' + B.steps.length + ' respins, ingots ' + B.filled + ', forged ' + B.nForged + (B.nForged ? ' ' + B.jpName : '') + '\n vals ' + B.vals.join(',') + '\n bonus win ' + B.win; }
+    s += '\nTOTAL ' + o.total;
+  }
+  if (rec) s += '\n-- shown -- grid ' + (rec.gridOk ? 'OK' : 'MISMATCH') + ' win ' + rec.win + (rec.winOk ? ' OK' : ' MISMATCH') + (rec.bonusOk != null ? ' bonus ' + (rec.bonusOk ? 'OK' : 'MISMATCH') : '');
+  dbgEl.textContent = s;
+}
+setInterval(function () { if (DEBUG && state === 'idle') updateDebug('tick', history[history.length - 1]); }, 1000);
+
+// ---------------- test hooks ----------------
+var FM = window.FM = {
+  get state() { return state; }, get outcome() { return outcome; }, get spinNo() { return spinNo; }, get balance() { return balance; },
+  get shownWin() { return shownWin; }, get shownBal() { return shownBal; }, get heat() { return heat.slice(); }, get fps() { return fps; },
+  get shownGrid() { return shownGrid.map(function (c) { return c.slice(); }); }, history: history, seed: SEED, bonusShown: null,
+  layout: function () { return { K: K, OX: OX, OY: OY, Lh: Lh, reelTop: reelTop, cellH: cellH, colW: colW, x0: x0, gap: gap, smithH: smithH, furnace: furnaceC(), smiths: [0, 1, 2, 3].map(function (i) { var b = smithBase(i), s = C.smith[i]; return { x: b.x, y: b.y - s.h * 0.5 }; }) }; },
+  toScreen: function (x, y) { return { x: OX + x * K, y: OY + y * K }; },
+  get armed() { return { ms: armedMs.slice(), bonus: armedBonus }; }
+};
+
+// ---------------- boot ----------------
+var LIST = ['bg', 'smith_0', 'smith_1', 'smith_2', 'smith_3'].concat(SYMN.map(function (n) { return 'sym_' + n; }));
+Promise.all(LIST.map(function (n) { return new Promise(function (res, rej) { var im = new Image(); im.onload = function () { IMG[n] = im; res(); }; im.onerror = function () { rej(new Error('asset ' + n)); }; im.src = 'assets/' + n + '.webp'; }); })
+  .concat([document.fonts && document.fonts.load ? document.fonts.load('30px Lilita').catch(function () {}) : Promise.resolve()]))
+  .then(function () {
+    layout(); state = 'idle';
+    var ld = document.getElementById('load'); if (ld) ld.remove();
+    updateDebug('boot');
+    requestAnimationFrame(frame);
+  });
+})();
+
+</script>
+</body>
+</html>
